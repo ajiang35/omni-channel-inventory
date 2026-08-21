@@ -22,29 +22,29 @@ async def consume_orders():
         # 2. Continuously listen for incoming messages
         async for msg in consumer:
             event_data = json.loads(msg.value.decode("utf-8"))
-            sku = event_data.get("sku")
             store_id = event_data.get("store_id")
-            
-            print(f"Received Order Event: SKU {sku} at Store {store_id}")
+            items = event_data.get("items", [])
+
+            print(f"Received Order Event: {event_data.get('order_id')} at Store {store_id}")
             
             # 3. Update PostgreSQL asynchronously using a database session
             db: Session = SessionLocal()
             try:
-                inventory_item = db.query(Inventory).filter(
-                    Inventory.sku == sku, 
-                    Inventory.store_id == store_id
-                ).first()
-                
-                if inventory_item:
-                    # Decrement the actual database quantity to stay synced with Redis
-                    if inventory_item.quantity > 0:
-                        inventory_item.quantity -= 1
-                        db.commit()
-                        print(f"DB Updated: SKU {sku} new quantity is {inventory_item.quantity}")
-                    else:
-                        print(f"Warning: DB quantity already 0 for SKU {sku}")
-                else:
-                    print(f"Error: Inventory record not found for SKU {sku} at Store {store_id}")
+                for item in items:
+                    sku = item.get("sku")
+                    quantity = item.get("quantity", 0)
+                    inventory_item = db.query(Inventory).filter(
+                        Inventory.sku == sku,
+                        Inventory.store_id == store_id
+                    ).first()
+
+                    if not inventory_item:
+                        raise ValueError(f"Inventory record not found for SKU {sku} at Store {store_id}")
+                    if inventory_item.quantity < quantity:
+                        raise ValueError(f"DB quantity too low for SKU {sku}")
+                    inventory_item.quantity -= quantity
+                db.commit()
+                print(f"DB updated for {len(items)} order items")
             except Exception as e:
                 db.rollback()
                 print(f"Database error while processing event: {str(e)}")
