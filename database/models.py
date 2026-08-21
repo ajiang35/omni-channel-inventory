@@ -23,6 +23,28 @@ class Store(Base):
         cascade="all, delete-orphan",
         passive_deletes=True,
     )
+    members = relationship(
+        "StoreMember",
+        back_populates="store",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+class StoreMember(Base):
+    """Grants a specific authenticated user (by JWT `sub`) access to a store."""
+    __tablename__ = "store_members"
+    __table_args__ = (
+        UniqueConstraint("store_id", "user_sub", name="uq_store_member_user"),
+        CheckConstraint("role in ('owner', 'staff')", name="ck_store_member_role_valid"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    store_id = Column(Integer, ForeignKey("stores.id", ondelete="CASCADE"), nullable=False)
+    user_sub = Column(String(255), nullable=False, index=True)
+    role = Column(String(20), nullable=False, default="staff")
+    created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+
+    store = relationship("Store", back_populates="members")
 
 class Inventory(Base):
     __tablename__ = "inventory"

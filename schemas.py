@@ -38,6 +38,20 @@ class StoreResponse(BaseModel):
     location_code: str
     address: Optional[str] = None
 
+class StoreMemberCreate(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    user_sub: str = Field(min_length=1, max_length=255)
+    role: str = Field(default="staff", pattern=r"^(owner|staff)$")
+
+class StoreMemberResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int = Field(gt=0)
+    store_id: int = Field(gt=0)
+    user_sub: str
+    role: str
+
 class InventoryAdd(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 

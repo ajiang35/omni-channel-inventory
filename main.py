@@ -12,7 +12,7 @@ from sqlalchemy import text
 from aiokafka import AIOKafkaProducer
 
 from database.db import get_db, redis_client
-from database.models import Inventory, Order, OrderItem, Receipt, Store
+from database.models import Inventory, Order, OrderItem, Receipt, Store, StoreMember
 from schemas import (
     InventoryAdd,
     InventoryAddResponse,
@@ -25,6 +25,8 @@ from schemas import (
     ReceiptResponse,
     StoreCreate,
     StoreCreateResponse,
+    StoreMemberCreate,
+    StoreMemberResponse,
     StoreResponse,
     StoreUpdate,
 )
@@ -59,6 +61,33 @@ def verify_oidc_token(credentials: HTTPAuthorizationCredentials = Security(secur
         return payload  # Returns the decoded user claims/token data
     except Exception as e:
         raise HTTPException(status_code=401, detail=f"Invalid or expired token: {str(e)}")
+
+def get_current_user_sub(user: dict = Depends(verify_oidc_token)) -> str:
+    """Extracts the stable Auth0 user id (`sub`) used as the authorization principal."""
+    sub = user.get("sub")
+    if not sub:
+        raise HTTPException(status_code=401, detail="Token missing subject claim")
+    return sub
+
+def _get_store_membership(store_id: int, user_sub: str, db: Session) -> StoreMember | None:
+    return (
+        db.query(StoreMember)
+        .filter(StoreMember.store_id == store_id, StoreMember.user_sub == user_sub)
+        .first()
+    )
+
+def _require_store_member(store_id: int, user_sub: str, db: Session) -> StoreMember:
+    member = _get_store_membership(store_id, user_sub, db)
+    if not member:
+        # 404 (not 403) so non-members can't distinguish "no access" from "doesn't exist"
+        raise HTTPException(status_code=404, detail="Store not found")
+    return member
+
+def _require_store_owner(store_id: int, user_sub: str, db: Session) -> StoreMember:
+    member = _require_store_member(store_id, user_sub, db)
+    if member.role != "owner":
+        raise HTTPException(status_code=403, detail="Owner role required for this action")
+    return member
 
 # Global variable for the Kafka producer
 kafka_producer: AIOKafkaProducer = None
@@ -125,7 +154,7 @@ def test_databases(db: Session = Depends(get_db)):
 def create_store(
     store: StoreCreate,
     db: Session = Depends(get_db),
-    user: dict = Depends(verify_oidc_token),
+    user_sub: str = Depends(get_current_user_sub),
 ) -> StoreCreateResponse:
     db_store = Store(name=store.name, location_code=store.location_code, address=store.address)
     db.add(db_store)
@@ -135,36 +164,44 @@ def create_store(
         db.rollback()
         raise HTTPException(status_code=409, detail="Location code already exists") from error
     db.refresh(db_store)
+
+    # Creator is automatically granted ownership of the store they created
+    db.add(StoreMember(store_id=db_store.id, user_sub=user_sub, role="owner"))
+    db.commit()
+
     return {"message": "Store created successfully", "store_id": db_store.id}
 
 @app.get("/stores/", response_model=list[StoreResponse])
 def list_stores(
     db: Session = Depends(get_db),
-    user: dict = Depends(verify_oidc_token),
+    user_sub: str = Depends(get_current_user_sub),
 ):
-    return db.query(Store).order_by(Store.id).all()
+    return (
+        db.query(Store)
+        .join(StoreMember, StoreMember.store_id == Store.id)
+        .filter(StoreMember.user_sub == user_sub)
+        .order_by(Store.id)
+        .all()
+    )
 
 @app.get("/stores/{store_id}", response_model=StoreResponse)
 def get_store(
     store_id: int,
     db: Session = Depends(get_db),
-    user: dict = Depends(verify_oidc_token),
+    user_sub: str = Depends(get_current_user_sub),
 ):
-    store = db.query(Store).filter(Store.id == store_id).first()
-    if not store:
-        raise HTTPException(status_code=404, detail="Store not found")
-    return store
+    _require_store_member(store_id, user_sub, db)
+    return db.query(Store).filter(Store.id == store_id).first()
 
 @app.patch("/stores/{store_id}", response_model=StoreResponse)
 def update_store(
     store_id: int,
     changes: StoreUpdate,
     db: Session = Depends(get_db),
-    user: dict = Depends(verify_oidc_token),
+    user_sub: str = Depends(get_current_user_sub),
 ):
+    _require_store_owner(store_id, user_sub, db)
     store = db.query(Store).filter(Store.id == store_id).first()
-    if not store:
-        raise HTTPException(status_code=404, detail="Store not found")
 
     for field, value in changes.model_dump(exclude_unset=True).items():
         setattr(store, field, value)
@@ -181,27 +218,84 @@ def update_store(
 def delete_store(
     store_id: int,
     db: Session = Depends(get_db),
-    user: dict = Depends(verify_oidc_token),
+    user_sub: str = Depends(get_current_user_sub),
 ):
+    _require_store_owner(store_id, user_sub, db)
     store = db.query(Store).filter(Store.id == store_id).first()
-    if not store:
-        raise HTTPException(status_code=404, detail="Store not found")
 
     for item in store.inventory:
         redis_client.delete(inventory_redis_key(item.sku, store_id))
     db.delete(store)
     db.commit()
 
+@app.get("/stores/{store_id}/members", response_model=list[StoreMemberResponse])
+def list_store_members(
+    store_id: int,
+    db: Session = Depends(get_db),
+    user_sub: str = Depends(get_current_user_sub),
+):
+    _require_store_member(store_id, user_sub, db)
+    return (
+        db.query(StoreMember)
+        .filter(StoreMember.store_id == store_id)
+        .order_by(StoreMember.id)
+        .all()
+    )
+
+@app.post("/stores/{store_id}/members", response_model=StoreMemberResponse, status_code=201)
+def add_store_member(
+    store_id: int,
+    member: StoreMemberCreate,
+    db: Session = Depends(get_db),
+    user_sub: str = Depends(get_current_user_sub),
+):
+    _require_store_owner(store_id, user_sub, db)
+    db_member = StoreMember(store_id=store_id, user_sub=member.user_sub, role=member.role)
+    db.add(db_member)
+    try:
+        db.commit()
+    except IntegrityError as error:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="User is already a member of this store") from error
+    db.refresh(db_member)
+    return db_member
+
+@app.delete("/stores/{store_id}/members/{member_id}", status_code=204)
+def remove_store_member(
+    store_id: int,
+    member_id: int,
+    db: Session = Depends(get_db),
+    user_sub: str = Depends(get_current_user_sub),
+):
+    _require_store_owner(store_id, user_sub, db)
+    member = (
+        db.query(StoreMember)
+        .filter(StoreMember.id == member_id, StoreMember.store_id == store_id)
+        .first()
+    )
+    if not member:
+        raise HTTPException(status_code=404, detail="Member not found")
+
+    if member.role == "owner":
+        owner_count = (
+            db.query(StoreMember)
+            .filter(StoreMember.store_id == store_id, StoreMember.role == "owner")
+            .count()
+        )
+        if owner_count <= 1:
+            raise HTTPException(status_code=400, detail="Cannot remove the last owner of a store")
+
+    db.delete(member)
+    db.commit()
+
 @app.post("/inventory/", response_model=InventoryAddResponse)
 def add_inventory(
     item: InventoryAdd, 
     db: Session = Depends(get_db),
-    user: dict = Depends(verify_oidc_token)
+    user_sub: str = Depends(get_current_user_sub),
 )-> InventoryAddResponse:
-    store = db.query(Store).filter(Store.id == item.store_id).first()
-    if not store:
-        raise HTTPException(status_code=404, detail="Store not found")
-        
+    _require_store_member(item.store_id, user_sub, db)
+
     db_item = Inventory(sku=item.sku, quantity=item.quantity, store_id=item.store_id)
     db.add(db_item)
     try:
@@ -223,34 +317,41 @@ def add_inventory(
 def list_inventory(
     store_id: int | None = None,
     db: Session = Depends(get_db),
-    user: dict = Depends(verify_oidc_token),
+    user_sub: str = Depends(get_current_user_sub),
 ):
-    query = db.query(Inventory).order_by(Inventory.id)
     if store_id is not None:
-        query = query.filter(Inventory.store_id == store_id)
-    return query.all()
+        _require_store_member(store_id, user_sub, db)
+        query = db.query(Inventory).filter(Inventory.store_id == store_id)
+    else:
+        query = (
+            db.query(Inventory)
+            .join(StoreMember, StoreMember.store_id == Inventory.store_id)
+            .filter(StoreMember.user_sub == user_sub)
+        )
+    return query.order_by(Inventory.id).all()
+
+def _get_authorized_inventory(inventory_id: int, user_sub: str, db: Session) -> Inventory:
+    item = db.query(Inventory).filter(Inventory.id == inventory_id).first()
+    if not item or not _get_store_membership(item.store_id, user_sub, db):
+        raise HTTPException(status_code=404, detail="Inventory item not found")
+    return item
 
 @app.get("/inventory/{inventory_id}", response_model=InventoryResponse)
 def get_inventory(
     inventory_id: int,
     db: Session = Depends(get_db),
-    user: dict = Depends(verify_oidc_token),
+    user_sub: str = Depends(get_current_user_sub),
 ):
-    item = db.query(Inventory).filter(Inventory.id == inventory_id).first()
-    if not item:
-        raise HTTPException(status_code=404, detail="Inventory item not found")
-    return item
+    return _get_authorized_inventory(inventory_id, user_sub, db)
 
 @app.patch("/inventory/{inventory_id}", response_model=InventoryResponse)
 def update_inventory(
     inventory_id: int,
     changes: InventoryUpdate,
     db: Session = Depends(get_db),
-    user: dict = Depends(verify_oidc_token),
+    user_sub: str = Depends(get_current_user_sub),
 ):
-    item = db.query(Inventory).filter(Inventory.id == inventory_id).first()
-    if not item:
-        raise HTTPException(status_code=404, detail="Inventory item not found")
+    item = _get_authorized_inventory(inventory_id, user_sub, db)
 
     item.quantity = changes.quantity
     db.commit()
@@ -262,24 +363,27 @@ def update_inventory(
 def delete_inventory(
     inventory_id: int,
     db: Session = Depends(get_db),
-    user: dict = Depends(verify_oidc_token),
+    user_sub: str = Depends(get_current_user_sub),
 ):
-    item = db.query(Inventory).filter(Inventory.id == inventory_id).first()
-    if not item:
-        raise HTTPException(status_code=404, detail="Inventory item not found")
+    item = _get_authorized_inventory(inventory_id, user_sub, db)
 
     redis_client.delete(inventory_redis_key(item.sku, item.store_id))
     db.delete(item)
     db.commit()
 
+def _get_authorized_order(order_id: str, user_sub: str, db: Session) -> Order:
+    order = db.query(Order).filter(Order.id == order_id).first()
+    if not order or not _get_store_membership(order.store_id, user_sub, db):
+        raise HTTPException(status_code=404, detail="Cart not found")
+    return order
+
 @app.post("/carts", response_model=CartResponse, status_code=201)
 def create_cart(
     cart: CartCreate,
     db: Session = Depends(get_db),
-    user: dict = Depends(verify_oidc_token),
+    user_sub: str = Depends(get_current_user_sub),
 ):
-    if not db.query(Store).filter(Store.id == cart.store_id).first():
-        raise HTTPException(status_code=404, detail="Store not found")
+    _require_store_member(cart.store_id, user_sub, db)
     order = Order(id=str(uuid4()), store_id=cart.store_id, status="CART")
     db.add(order)
     db.commit()
@@ -291,11 +395,9 @@ def add_cart_item(
     order_id: str,
     item: CartItemCreate,
     db: Session = Depends(get_db),
-    user: dict = Depends(verify_oidc_token),
+    user_sub: str = Depends(get_current_user_sub),
 ):
-    order = db.query(Order).filter(Order.id == order_id).first()
-    if not order:
-        raise HTTPException(status_code=404, detail="Cart not found")
+    order = _get_authorized_order(order_id, user_sub, db)
     if order.status != "CART":
         raise HTTPException(status_code=409, detail="Cart is no longer editable")
     if not db.query(Inventory).filter(
@@ -318,22 +420,17 @@ def add_cart_item(
 def get_cart(
     order_id: str,
     db: Session = Depends(get_db),
-    user: dict = Depends(verify_oidc_token),
+    user_sub: str = Depends(get_current_user_sub),
 ):
-    order = db.query(Order).filter(Order.id == order_id).first()
-    if not order:
-        raise HTTPException(status_code=404, detail="Cart not found")
-    return order
+    return _get_authorized_order(order_id, user_sub, db)
 
 @app.post("/carts/{order_id}/confirm", response_model=OrderConfirmationResponse)
 async def confirm_cart(
     order_id: str,
     db: Session = Depends(get_db),
-    user: dict = Depends(verify_oidc_token),
+    user_sub: str = Depends(get_current_user_sub),
 ):
-    order = db.query(Order).filter(Order.id == order_id).first()
-    if not order:
-        raise HTTPException(status_code=404, detail="Cart not found")
+    order = _get_authorized_order(order_id, user_sub, db)
     if order.status != "CART":
         raise HTTPException(status_code=409, detail="Cart is already confirmed")
     if not order.items:
@@ -395,10 +492,10 @@ async def confirm_cart(
 def get_receipt(
     receipt_id: str,
     db: Session = Depends(get_db),
-    user: dict = Depends(verify_oidc_token),
+    user_sub: str = Depends(get_current_user_sub),
 ):
     receipt = db.query(Receipt).filter(Receipt.id == receipt_id).first()
-    if not receipt:
+    if not receipt or not _get_store_membership(receipt.store_id, user_sub, db):
         raise HTTPException(status_code=404, detail="Receipt not found")
     return ReceiptResponse(
         id=receipt.id,
