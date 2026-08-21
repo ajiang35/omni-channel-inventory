@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 from aiokafka import AIOKafkaConsumer
 from sqlalchemy.orm import Session
 from database.db import SessionLocal
@@ -9,7 +10,7 @@ async def consume_orders():
     # 1. Initialize the Kafka Consumer
     consumer = AIOKafkaConsumer(
         "orders.created",
-        bootstrap_servers='localhost:9092',
+        bootstrap_servers=os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092"),
         group_id="inventory-update-group",
         auto_offset_reset="earliest"
     )

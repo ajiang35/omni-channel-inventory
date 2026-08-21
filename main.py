@@ -1,4 +1,5 @@
 import json
+import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends, HTTPException, Security
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -17,8 +18,14 @@ from schemas import StoreCreate, InventoryAdd
 security = HTTPBearer()
 
 # Auth0 JWKS client to automatically fetch and cache public keys for token verification
-AUTH0_DOMAIN = "https://dev-esduje7m3lh8oo8n.us.auth0.com/"  # Replace with your Auth0 domain
-AUTH0_API_AUDIENCE = "https://api.omni-inventory.com"    # Your Auth0 API Identifier
+AUTH0_DOMAIN = os.getenv(
+    "AUTH0_DOMAIN",
+    "https://dev-esduje7m3lh8oo8n.us.auth0.com/",
+)
+AUTH0_API_AUDIENCE = os.getenv(
+    "AUTH0_API_AUDIENCE",
+    "https://api.omni-inventory.com",
+)
 jwks_url = f"{AUTH0_DOMAIN}.well-known/jwks.json"
 jwks_client = PyJWKClient(jwks_url)
 
@@ -43,7 +50,9 @@ kafka_producer: AIOKafkaProducer = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global kafka_producer
-    kafka_producer = AIOKafkaProducer(bootstrap_servers='localhost:9092')
+    kafka_producer = AIOKafkaProducer(
+        bootstrap_servers=os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+    )
     await kafka_producer.start()
     print("Kafka Producer started successfully!")
     
