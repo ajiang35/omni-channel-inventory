@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: omni-inventory-config
+  namespace: omni-inventory
+  labels:
+    app.kubernetes.io/name: omni-inventory
+    app.kubernetes.io/part-of: omni-inventory
+data:
+  POSTGRES_DB: inventory_db
+  POSTGRES_USER: postgres
+  DATABASE_HOST: omni-postgres
+  DATABASE_PORT: "5432"
+  DATABASE_NAME: inventory_db
+  DATABASE_USER: postgres
+  REDIS_HOST: omni-redis
+  REDIS_PORT: "6379"
+  REDIS_URL: redis://omni-redis:6379/0
+  KAFKA_BOOTSTRAP_SERVERS: omni-kafka:9092
+  AUTH0_DOMAIN: https://your-tenant.auth0.com/
+  AUTH0_API_AUDIENCE: https://your-api-audience
+  APP_ENV: production

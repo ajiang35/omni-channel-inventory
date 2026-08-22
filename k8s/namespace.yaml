@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: omni-inventory
+  labels:
+    app.kubernetes.io/name: omni-inventory
+    app.kubernetes.io/part-of: omni-inventory
+    app.kubernetes.io/component: platform
