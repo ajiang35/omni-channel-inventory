@@ -2,13 +2,13 @@ import json
 import os
 from uuid import uuid4
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Depends, HTTPException, Security
+from fastapi import FastAPI, Depends, HTTPException, Query, Security
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import jwt
 from jwt import PyJWKClient
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
-from sqlalchemy import text
+from sqlalchemy import asc, desc, text
 from aiokafka import AIOKafkaProducer
 
 from database.db import get_db, redis_client
@@ -29,6 +29,7 @@ from schemas import (
     StoreMemberResponse,
     StoreResponse,
     StoreUpdate,
+    PaginatedResponse,
 )
 
 # --- CLEAN JWT / OIDC BEARER AUTHENTICATION ---
@@ -171,18 +172,41 @@ def create_store(
 
     return {"message": "Store created successfully", "store_id": db_store.id}
 
-@app.get("/stores/", response_model=list[StoreResponse])
+@app.get("/stores/", response_model=PaginatedResponse)
 def list_stores(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    sort_by: str = Query("id", pattern=r"^(id|name|location_code)$"),
+    order: str = Query("asc", pattern=r"^(asc|desc)$"),
     db: Session = Depends(get_db),
     user_sub: str = Depends(get_current_user_sub),
 ):
-    return (
+    query = (
         db.query(Store)
         .join(StoreMember, StoreMember.store_id == Store.id)
         .filter(StoreMember.user_sub == user_sub)
-        .order_by(Store.id)
-        .all()
     )
+
+    sort_column = {
+        "id": Store.id,
+        "name": Store.name,
+        "location_code": Store.location_code,
+    }.get(sort_by, Store.id)
+
+    ordered_query = query.order_by(desc(sort_column) if order == "desc" else asc(sort_column))
+    total_items = ordered_query.count()
+    items = ordered_query.offset((page - 1) * page_size).limit(page_size).all()
+    total_pages = (total_items + page_size - 1) // page_size if total_items else 0
+
+    return {
+        "items": items,
+        "page": page,
+        "page_size": page_size,
+        "total_items": total_items,
+        "total_pages": total_pages,
+        "has_next": page < total_pages,
+        "has_previous": page > 1 and total_pages > 0,
+    }
 
 @app.get("/stores/{store_id}", response_model=StoreResponse)
 def get_store(
@@ -313,9 +337,13 @@ def add_inventory(
     
     return {"message": "Inventory added successfully", "sku": db_item.sku, "quantity": db_item.quantity}
 
-@app.get("/inventory/", response_model=list[InventoryResponse])
+@app.get("/inventory/", response_model=PaginatedResponse)
 def list_inventory(
     store_id: int | None = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    sort_by: str = Query("id", pattern=r"^(id|sku|quantity|store_id)$"),
+    order: str = Query("asc", pattern=r"^(asc|desc)$"),
     db: Session = Depends(get_db),
     user_sub: str = Depends(get_current_user_sub),
 ):
@@ -328,7 +356,28 @@ def list_inventory(
             .join(StoreMember, StoreMember.store_id == Inventory.store_id)
             .filter(StoreMember.user_sub == user_sub)
         )
-    return query.order_by(Inventory.id).all()
+
+    sort_column = {
+        "id": Inventory.id,
+        "sku": Inventory.sku,
+        "quantity": Inventory.quantity,
+        "store_id": Inventory.store_id,
+    }.get(sort_by, Inventory.id)
+
+    ordered_query = query.order_by(desc(sort_column) if order == "desc" else asc(sort_column))
+    total_items = ordered_query.count()
+    items = ordered_query.offset((page - 1) * page_size).limit(page_size).all()
+    total_pages = (total_items + page_size - 1) // page_size if total_items else 0
+
+    return {
+        "items": items,
+        "page": page,
+        "page_size": page_size,
+        "total_items": total_items,
+        "total_pages": total_pages,
+        "has_next": page < total_pages,
+        "has_previous": page > 1 and total_pages > 0,
+    }
 
 def _get_authorized_inventory(inventory_id: int, user_sub: str, db: Session) -> Inventory:
     item = db.query(Inventory).filter(Inventory.id == inventory_id).first()
